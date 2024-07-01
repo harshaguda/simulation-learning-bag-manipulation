@@ -1,0 +1,239 @@
+# Copyright (c) 2018-2022, NVIDIA Corporation
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+import gym
+import hydra
+from omegaconf import DictConfig
+import os
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+import omniisaacgymenvs
+from omniisaacgymenvs.envs.vec_env_rlgames import VecEnvRLGames
+from omniisaacgymenvs.utils.config_utils.path_utils import get_experience
+from omniisaacgymenvs.utils.hydra_cfg.hydra_utils import *
+from omniisaacgymenvs.utils.hydra_cfg.reformat import omegaconf_to_dict, print_dict
+from utils.task_util import initialize_task
+
+from skrl.envs.wrappers.torch import wrap_env
+from skrl.memories.torch import RandomMemory
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+from skrl.resources.preprocessors.torch import RunningStandardScaler
+from skrl.resources.schedulers.torch import KLAdaptiveRL
+from skrl.trainers.torch import SequentialTrainer
+# from skrl.utils import set_seed
+from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+
+class Shared(GaussianMixin, DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device,
+                 clip_actions=False,
+                 clip_log_std=True,
+                 min_log_std=-20, max_log_std=2, reduction="sum"):
+        Model.__init__(self, observation_space, action_space, device)
+        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std,
+                               max_log_std, reduction)
+        DeterministicMixin.__init__(self, clip_actions)
+
+        self.net = nn.Sequential(nn.Flatten(),
+                                 nn.Linear(self.num_observations, 256),
+                                 nn.ELU(),
+                                #  nn.Linear(1024, 2048),
+                                #  nn.ELU(),
+                                #  nn.Linear(2048, 1024),
+                                #  nn.ELU(),
+                                #  nn.Linear(1024, 512),
+                                #  nn.ELU(),
+                                #  nn.Linear(512, 256),
+                                #  nn.ELU(),
+                                #  nn.Linear(256, 256),
+                                #  nn.ELU(),
+                                #  nn.Linear(256, 256),
+                                #  nn.ELU(),
+                                 nn.Linear(256, 256),
+                                 nn.ELU(),
+                                 nn.Linear(256, 128),
+                                 nn.ELU(),
+                                 nn.Linear(128, 128),
+                                 nn.ELU(),
+                                 nn.Linear(128, 128),
+                                 nn.ELU(),
+                                 nn.Linear(128, 64),
+                                 nn.ELU(),
+                                 nn.Linear(64, 32),
+                                 nn.ELU(),
+                                 nn.Linear(32, 32),
+                                 nn.ELU())
+
+        self.mean_layer = nn.Linear(32, self.num_actions)
+        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
+
+        self.value_layer = nn.Linear(32, 1)
+
+    def act(self, inputs, role):
+        if role == "policy":
+            return GaussianMixin.act(self, inputs, role)
+        elif role == "value":
+            return DeterministicMixin.act(self, inputs, role)
+
+    def compute(self, inputs, role):
+        if role == "policy":
+            return (self.mean_layer(self.net(inputs["states"])),
+                    self.log_std_parameter, {})
+        elif role == "value":
+            return self.value_layer(self.net(inputs["states"])), {}
+
+
+
+@hydra.main(version_base=None, config_name="config", config_path="../cfg")
+def parse_hydra_configs(cfg: DictConfig):
+
+    cfg_dict = omegaconf_to_dict(cfg)
+    print_dict(cfg_dict)
+
+    headless = cfg.headless
+    render = not headless
+    enable_viewport = "enable_cameras" in cfg.task.sim and cfg.task.sim.enable_cameras
+
+    # select kit app file
+    experience = get_experience(headless, cfg.enable_livestream, enable_viewport, cfg.enable_recording, cfg.kit_app)
+
+    env = VecEnvRLGames(
+        headless=headless,
+        sim_device=cfg.device_id,
+        enable_livestream=cfg.enable_livestream,
+        enable_viewport=enable_viewport or cfg.enable_recording,
+        experience=experience
+    )
+    # parse experiment directory
+    module_path = os.path.abspath(os.path.join(os.path.dirname(omniisaacgymenvs.__file__)))
+    experiment_dir = os.path.join(module_path, "runs", cfg.train.params.config.name)
+
+    # use gym RecordVideo wrapper for viewport recording
+    if cfg.enable_recording:
+        if cfg.recording_dir == '':
+            videos_dir = os.path.join(experiment_dir, "videos")
+        else:
+            videos_dir = cfg.recording_dir
+        print(videos_dir)
+        video_interval = lambda step: step % cfg.recording_interval == 0
+        video_length = cfg.recording_length
+        env.is_vector_env = True
+        if env.metadata is None:
+            env.metadata = {"render_modes": ["rgb_array"], "render_fps": cfg.recording_fps}
+        else:
+            env.metadata["render_modes"] = ["rgb_array"]
+            env.metadata["render_fps"] = cfg.recording_fps
+        env = gym.wrappers.RecordVideo(
+            env, video_folder=videos_dir, step_trigger=video_interval, video_length=video_length
+        )
+
+    # sets seed. if seed is -1 will pick a random one
+    from omni.isaac.core.utils.torch.maths import set_seed
+
+    cfg.seed = set_seed(cfg.seed, torch_deterministic=cfg.torch_deterministic)
+    cfg_dict["seed"] = cfg.seed
+    task = initialize_task(cfg_dict, env)
+    print(wrap_env(env))
+    exit()
+    device = "cuda"
+  
+    # instantiate a memory as rollout buffer (any memory can be used for this)
+    memory = RandomMemory(memory_size=16,
+                          num_envs=env.num_envs, device=device)
+
+    # instantiate the agent's models (function approximators).
+    # PPO requires 2 models, visit its documentation for more details
+    # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html#models
+    models = {}
+    models["policy"] = Shared(env.observation_space, env.action_space, device)
+    models["value"] = models["policy"]  # same instance: shared model
+
+    # configure and instantiate the agent (visit its documentation to see all
+    # the options)
+    # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html#configuration-and-hyperparameters
+    cfg_policy = PPO_DEFAULT_CONFIG.copy()
+    cfg_policy["rollouts"] = 16#episode_length * 8 #16  # episode_length * 16  # memory_size
+    cfg_policy["learning_epochs"] = 8 #episode_length * 4  # episode_length * 8
+    cfg_policy["mini_batches"] = 8 #episode_length * 2  # episode_length * 2  # 16 * 512 / 8192
+    cfg_policy["discount_factor"] = 0.99
+    cfg_policy["lambda"] = 0.95
+    cfg_policy["learning_rate"] = 30e-4
+    cfg_policy["learning_rate_scheduler"] = KLAdaptiveRL
+    cfg_policy["learning_rate_scheduler_kwargs"] = {"kl_threshold": 0.008}
+    cfg_policy["random_timesteps"] = 0#episode_length * 512
+    cfg_policy["learning_starts"] = 0#(episode_length + 1) * 512
+    cfg_policy["grad_norm_clip"] = 1.0
+    cfg_policy["ratio_clip"] = 0.2
+    cfg_policy["value_clip"] = 0.2
+    cfg_policy["clip_predicted_values"] = True
+    cfg_policy["entropy_loss_scale"] = 0.01*2
+    cfg_policy["value_loss_scale"] = 2.0
+    cfg_policy["kl_threshold"] = 0
+    cfg_policy["rewards_shaper"] = lambda rewards, timestep, timesteps: rewards * 0.1
+    cfg_policy["state_preprocessor"] = RunningStandardScaler
+    cfg_policy["state_preprocessor_kwargs"] = {"size": env.observation_space,
+                                        "device": device}
+    cfg_policy["value_preprocessor"] = RunningStandardScaler
+    cfg_policy["value_preprocessor_kwargs"] = {"size": 1, "device": device}
+    # logging to TensorBoard and write checkpoints (in timesteps)
+    cfg_policy["experiment"]["write_interval"] = 16
+    cfg_policy["experiment"]["checkpoint_interval"] = 128 * 64
+    cfg_policy["experiment"]["directory"] = "runs/torch/" + "TestVideRec"
+    cfg_policy["experiment"]["wandb"] = True
+    cfg_policy["experiment"]["wandb_kwargs"] = {"name": "TestVideRec",
+                                         "sync_tensorboard": True}
+    agent = PPO(models=models,
+                memory=memory,
+                cfg=cfg_policy,
+                observation_space=env.observation_space,
+                action_space=env.action_space,
+                device=device)
+
+    
+    if False:
+        # configure and instantiate the RL trainer
+        cfg_trainer = {"timesteps": 1600 * 30, "headless": True}
+        trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
+        agent.load("agent_51200.pt")
+        trainer.eval()
+    else:
+        # configure and instantiate the RL trainer
+        cfg_trainer = {"timesteps": 1600 * 3000, "headless": True}
+        trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
+        # agent.load("best_agent.pt")
+        # start training
+        trainer.train()
+
+
+
+if __name__ == "__main__":
+    parse_hydra_configs()
